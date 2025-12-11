@@ -6,6 +6,8 @@
 int
 main(int argc, char *argv[])
 {
+
+  printf("???\n");
   int i;
   char *nargv[MAXARG];
 

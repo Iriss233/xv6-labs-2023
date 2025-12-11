@@ -105,6 +105,7 @@ CFLAGS += -fno-builtin-memcpy -Wno-main
 CFLAGS += -fno-builtin-printf -fno-builtin-fprintf -fno-builtin-vprintf
 CFLAGS += -I.
 CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+# CFLAGS += -DLAB_SYSCALL  # ← 添加这一行
 
 ifeq ($(LAB),net)
 CFLAGS += -DNET_TESTS_PORT=$(SERVERPORT)
@@ -194,6 +195,7 @@ UPROGS=\
 	$U/_grind\
 	$U/_wc\
 	$U/_zombie\
+	$U/_trace\
 
 
 
