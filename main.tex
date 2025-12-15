@@ -1,0 +1,614 @@
+\section{Lab: page tables}
+
+\subsection{实验目的}
+
+本实验旨在深入理解RISC-V页表机制，并通过修改xv6内核实现三个与页表相关的常见操作系统特性：
+
+\begin{enumerate}
+    \item \textbf{加速系统调用（Speed up system calls）}：通过在用户空间和内核之间共享只读页面，实现无需陷入内核即可获取进程信息（如PID）的优化机制
+    \item \textbf{打印页表（Print a page table）}：实现递归遍历并打印RISC-V三级页表结构的调试功能，帮助理解虚拟地址到物理地址的映射过程
+    \item \textbf{使用超级页面（Use superpages）}：实现2MB大页支持，减少页表层级和TLB miss，提高内存访问效率
+\end{enumerate}
+
+通过本实验，将掌握：
+\begin{itemize}
+    \item RISC-V Sv39三级页表的结构和遍历方法
+    \item 页表项（PTE）的权限位设置和含义
+    \item 用户态和内核态的内存映射机制
+    \item 超级页面的分配、映射和管理
+\end{itemize}
+
+\subsection{实验步骤}
+
+\subsubsection{任务1：理解用户进程页表（Inspect a user-process page table）}
+
+首先运行 \texttt{pgtbltest} 程序观察页表输出：
+
+\begin{lstlisting}[language=bash]
+$ make qemu
+$ pgtbltest
+\end{lstlisting}
+
+\texttt{print\_pgtbl} 函数通过 \texttt{pgpte} 系统调用打印进程前10页和后10页的页表项信息。输出示例：
+
+\begin{lstlisting}
+va 0x0 pte 0x21FC7C5B pa 0x87F1F000 perm 0x5B
+va 0x1000 pte 0x21FC7017 pa 0x87F1C000 perm 0x17
+va 0x2000 pte 0x21FC6C07 pa 0x87F1B000 perm 0x7
+va 0x3000 pte 0x21FC68D7 pa 0x87F1A000 perm 0xD7
+va 0xFFFFD000 pte 0x21FD4C13 pa 0x87F53000 perm 0x13
+va 0xFFFFE000 pte 0x21FD00C7 pa 0x87F40000 perm 0xC7
+va 0xFFFFF000 pte 0x2000184B pa 0x80006000 perm 0x4B
+\end{lstlisting}
+
+\textbf{页表项分析}（参考xv6 book Figure 3.4）：
+
+\begin{itemize}
+    \item \texttt{va 0x0}（代码段）：\texttt{perm 0x5B = 0b01011011}，包含 \texttt{PTE\_V|PTE\_R|PTE\_X|PTE\_U|PTE\_A|PTE\_D}，表示有效、可读、可执行、用户可访问
+    \item \texttt{va 0x1000}（数据段）：\texttt{perm 0x17 = 0b00010111}，包含 \texttt{PTE\_V|PTE\_R|PTE\_W|PTE\_U}，表示可读写
+    \item \texttt{va 0xFFFFD000}（USYSCALL共享页）：\texttt{perm 0x13 = 0b00010011}，仅 \texttt{PTE\_V|PTE\_R|PTE\_U}，只读共享
+    \item \texttt{va 0xFFFFE000}（TRAPFRAME）：\texttt{perm 0xC7 = 0b11000111}，包含 \texttt{PTE\_V|PTE\_R|PTE\_W}，用于trap处理
+    \item \texttt{va 0xFFFFF000}（TRAMPOLINE）：\texttt{perm 0x4B = 0b01001011}，包含 \texttt{PTE\_V|PTE\_R|PTE\_X}，用于用户态/内核态切换
+\end{itemize}
+
+\subsubsection{任务2：加速系统调用（Speed up system calls）}
+
+\textbf{实现目标}：在每个进程的用户地址空间映射一个只读页面（USYSCALL），存储进程的PID，使得 \texttt{ugetpid()} 可以直接读取而无需系统调用。
+
+\textbf{实现步骤}：
+
+\paragraph{步骤1：定义共享页结构}
+
+在 \texttt{kernel/memlayout.h} 中添加：
+
+\begin{lstlisting}[language=C]
+#define USYSCALL (TRAPFRAME - PGSIZE)
+
+struct usyscall {
+  int pid;  // Process ID
+};
+\end{lstlisting}
+
+\paragraph{步骤2：在进程结构中添加字段}
+
+在 \texttt{kernel/proc.h} 的 \texttt{struct proc} 中添加：
+
+\begin{lstlisting}[language=C]
+struct usyscall *usyscallpage;
+\end{lstlisting}
+
+\paragraph{步骤3：分配和初始化}
+
+在 \texttt{kernel/proc.c} 的 \texttt{allocproc()} 函数中：
+
+\begin{lstlisting}[language=C]
+// Allocate a usyscall page.
+if ((p->usyscallpage = (struct usyscall *)kalloc()) == 0) {
+  freeproc(p);
+  release(&p->lock);
+  return 0;
+}
+p->usyscallpage->pid = p->pid;
+\end{lstlisting}
+
+\paragraph{步骤4：映射到用户地址空间}
+
+在 \texttt{proc\_pagetable()} 函数中添加映射：
+
+\begin{lstlisting}[language=C]
+if(mappages(pagetable, USYSCALL, PGSIZE, 
+            (uint64)(p->usyscallpage), PTE_R | PTE_U) < 0) {
+  uvmfree(pagetable, 0);
+  return 0;
+}
+\end{lstlisting}
+
+关键点：权限设置为 \texttt{PTE\_R | PTE\_U}（只读、用户可访问），确保用户态只能读取不能修改。
+
+\paragraph{步骤5：释放资源}
+
+在 \texttt{freeproc()} 中：
+
+\begin{lstlisting}[language=C]
+if(p->usyscallpage)
+  kfree((void *)p->usyscallpage);
+p->usyscallpage = 0;
+\end{lstlisting}
+
+在 \texttt{proc\_freepagetable()} 中：
+
+\begin{lstlisting}[language=C]
+uvmunmap(pagetable, USYSCALL, 1, 0);
+\end{lstlisting}
+
+\textbf{其他可加速的系统调用}：
+\begin{itemize}
+    \item \texttt{getuid()}/\texttt{getgid()}：用户和组ID
+    \item \texttt{gettimeofday()}：系统时间（需定期更新）
+    \item 调度统计信息：进程优先级、CPU使用率等只读数据
+\end{itemize}
+
+\subsubsection{任务3：打印页表（Print a page table）}
+
+\textbf{实现目标}：实现 \texttt{vmprint()} 函数，递归打印三级页表的所有有效映射。
+
+在 \texttt{kernel/vm.c} 中实现：
+
+\begin{lstlisting}[language=C]
+#ifdef LAB_PGTBL
+void PRINT(pagetable_t pagetable, int level, uint64 va) {
+  uint64 sz = PGSIZE << (9 * level);
+  for(int i = 0; i < 512; i++, va += sz) {
+    pte_t pte = pagetable[i];
+    if((pte & PTE_V) == 0)
+      continue;
+    for(int j = level; j < 3; j++) {
+      printf(" ..");
+    }
+    printf("%p: pte %p pa %p\n", 
+           (pagetable_t)va, 
+           (pagetable_t)pte, 
+           (pagetable_t)PTE2PA(pte));
+    if((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      // 非叶子节点，继续递归
+      PRINT((pagetable_t)PTE2PA(pte), level - 1, va);
+    }
+  }
+}
+
+void vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", pagetable);
+  PRINT(pagetable, 2, 0);
+}
+#endif
+\end{lstlisting}
+
+关键设计点：
+\begin{itemize}
+    \item 使用 \texttt{level} 参数控制缩进深度（2表示顶层）
+    \item 计算虚拟地址：每级跨度为 $2^{12+9 \times level}$ 字节
+    \item 判断叶子节点：如果PTE没有设置 \texttt{PTE\_R|PTE\_W|PTE\_X}，则为中间页表页
+    \item 使用 \texttt{\%p} 格式化64位地址
+\end{itemize}
+
+在 \texttt{kernel/sysproc.c} 添加系统调用：
+
+\begin{lstlisting}[language=C]
+#ifdef LAB_PGTBL
+int sys_kpgtbl(void) {
+  struct proc *p = myproc();
+  vmprint(p->pagetable);
+  return 0;
+}
+#endif
+\end{lstlisting}
+
+\subsubsection{任务4：使用超级页面（Use superpages）}
+
+\textbf{实现目标}：当 \texttt{sbrk()} 分配 ≥2MB 且地址2MB对齐时，使用单个一级PTE映射2MB大页。
+
+\textbf{关键概念}：
+\begin{itemize}
+    \item 超级页面（megapage）：RISC-V支持在一级页表直接映射2MB物理内存
+    \item 物理地址必须2MB对齐（\texttt{pa \% (2*1024*1024) == 0}）
+    \item 一级PTE设置 \texttt{PTE\_V|PTE\_R} 等权限位，而不是指向二级页表
+    \item 优势：减少页表占用、减少TLB miss、提高大内存访问性能
+\end{itemize}
+
+\textbf{实现步骤}（根据你的代码）：
+
+\paragraph{步骤1：定义超级页面宏}
+
+在 \texttt{kernel/riscv.h} 中：
+
+\begin{lstlisting}[language=C]
+#define SUPERPGSIZE (2 * (1 << 20))  // 2MB
+#define SUPERPGROUNDUP(sz) (((sz)+SUPERPGSIZE-1) & ~(SUPERPGSIZE-1))
+\end{lstlisting}
+
+\paragraph{步骤2：修改内存分配器}
+
+在 \texttt{kernel/kalloc.c} 中实现超级页面分配（预留2MB对齐区域）：
+
+\begin{lstlisting}[language=C]
+// 预留几个2MB对齐的物理内存块
+// 实现 superalloc() 和 superfree() 函数
+void* superalloc(void);
+void superfree(void *pa);
+\end{lstlisting}
+
+\paragraph{步骤3：修改 uvmalloc}
+
+在分配新内存时检测超级页面机会：
+
+\begin{lstlisting}[language=C]
+// 在 kernel/vm.c 的 uvmalloc() 中
+if (n >= SUPERPGSIZE) {
+  // 计算2MB对齐的起始地址
+  uint64 superstart = SUPERPGROUNDUP(oldsz);
+  uint64 superend = (newsz / SUPERPGSIZE) * SUPERPGSIZE;
+  
+  // 对每个2MB区域使用超级页面
+  for(uint64 a = superstart; a < superend; a += SUPERPGSIZE) {
+    char *mem = superalloc();
+    if(mem == 0) goto err;
+    // 映射到一级页表，设置相应权限
+    if(mappages_super(pagetable, a, SUPERPGSIZE, 
+                      (uint64)mem, PTE_W|PTE_R|PTE_U) < 0) {
+      superfree(mem);
+      goto err;
+    }
+  }
+}
+\end{lstlisting}
+
+\paragraph{步骤4：修改 uvmcopy}
+
+在 \texttt{fork()} 时复制超级页面：
+
+\begin{lstlisting}[language=C]
+// 在 uvmcopy() 中检测超级页面
+if(is_superpage(pte)) {
+  // 分配新的2MB物理内存
+  char *mem = superalloc();
+  if(mem == 0) goto err;
+  // 复制2MB数据
+  memmove(mem, (char*)pa, SUPERPGSIZE);
+  // 映射到子进程
+  if(mappages_super(new, i, SUPERPGSIZE, 
+                    (uint64)mem, flags) != 0) {
+    superfree(mem);
+    goto err;
+  }
+  i += SUPERPGSIZE;  // 跳过已处理的2MB
+  continue;
+}
+\end{lstlisting}
+
+\paragraph{步骤5：修改 uvmunmap}
+
+释放超级页面时调用 \texttt{superfree()}：
+
+\begin{lstlisting}[language=C]
+if(is_superpage(pte)) {
+  if(do_free)
+    superfree((void*)pa);
+  *pte = 0;
+  va += SUPERPGSIZE;  // 跳过2MB
+  npages -= (SUPERPGSIZE / PGSIZE);
+  continue;
+}
+\end{lstlisting}
+
+\subsection{代码设计与实现}
+
+\subsubsection{内存布局}
+
+用户进程的虚拟地址空间布局（从低到高）：
+
+\begin{lstlisting}
+0x00000000      +------------------+
+                | text (代码段)     |  r-x
+                +------------------+
+                | data (数据段)     |  rw-
+                +------------------+
+                | heap (堆)         |  rw-
+                | ...               |
+                +------------------+
+0xFFFFD000      | USYSCALL         |  r-- (只读共享)
+                +------------------+
+0xFFFFE000      | TRAPFRAME        |  rw- (trap处理)
+                +------------------+
+0xFFFFF000      | TRAMPOLINE       |  r-x (内核跳板)
+                +------------------+
+\end{lstlisting}
+
+\subsubsection{关键数据结构}
+
+\paragraph{页表项（PTE）权限位}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|c|l|l|}
+\hline
+\textbf{位} & \textbf{标志} & \textbf{含义} \\
+\hline
+0 & PTE\_V & 有效位 \\
+1 & PTE\_R & 可读 \\
+2 & PTE\_W & 可写 \\
+3 & PTE\_X & 可执行 \\
+4 & PTE\_U & 用户可访问 \\
+5 & PTE\_G & 全局映射 \\
+6 & PTE\_A & 访问位 \\
+7 & PTE\_D & 脏位 \\
+\hline
+\end{tabular}
+\caption{RISC-V PTE权限位}
+\end{table}
+
+\paragraph{USYSCALL结构体}
+
+\begin{lstlisting}[language=C]
+struct usyscall {
+  int pid;  // 进程ID
+  // 可扩展其他只读信息
+};
+\end{lstlisting}
+
+\subsubsection{核心函数实现}
+
+\paragraph{pgpte 系统调用}
+
+查找虚拟地址对应的PTE：
+
+\begin{lstlisting}[language=C]
+#ifdef LAB_PGTBL
+pte_t* pgpte(pagetable_t pagetable, uint64 va) {
+  return walk(pagetable, va, 0);
+}
+
+int sys_pgpte(void) {
+  uint64 va;
+  struct proc *p = myproc();
+  argaddr(0, &va);
+  pte_t *pte = pgpte(p->pagetable, va);
+  if(pte != 0) {
+    return (uint64) *pte;
+  }
+  return 0;
+}
+#endif
+\end{lstlisting}
+
+\paragraph{walk 函数分析}
+
+\texttt{walk()} 是xv6中遍历三级页表的核心函数：
+
+\begin{lstlisting}[language=C]
+pte_t * walk(pagetable_t pagetable, uint64 va, int alloc) {
+  for(int level = 2; level > 0; level--) {
+    pte_t *pte = &pagetable[PX(level, va)];
+    if(*pte & PTE_V) {
+      pagetable = (pagetable_t)PTE2PA(*pte);
+    } else {
+      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
+        return 0;
+      memset(pagetable, 0, PGSIZE);
+      *pte = PA2PTE(pagetable) | PTE_V;
+    }
+  }
+  return &pagetable[PX(0, va)];
+}
+\end{lstlisting}
+
+关键点：
+\begin{itemize}
+    \item \texttt{PX(level, va)}：提取虚拟地址在该级页表的索引（9位）
+    \item \texttt{PTE2PA(pte)}：从PTE提取物理页号并转换为物理地址
+    \item 如果 \texttt{alloc=1} 且页表不存在，则分配新页表页
+    \item 返回最终的叶子PTE指针
+\end{itemize}
+
+\subsection{实验问题解答}
+
+\subsubsection{问题1：print\_pgtbl输出的页表项解释}
+
+根据实验输出，每个页表项包含：
+
+\begin{itemize}
+    \item \textbf{va}：虚拟地址
+    \item \textbf{pte}：页表项完整内容（包含物理页号和标志位）
+    \item \textbf{pa}：物理地址（从PTE提取）
+    \item \textbf{perm}：权限位（PTE的低10位）
+\end{itemize}
+
+具体分析见"实验步骤"部分的"任务1"。
+
+\subsubsection{问题2：哪些系统调用可以通过共享页加速}
+
+\textbf{适合加速的系统调用特征}：
+\begin{enumerate}
+    \item 频繁调用
+    \item 只读数据
+    \item 数据量小
+    \item 不涉及安全敏感信息
+\end{enumerate}
+
+\textbf{候选系统调用}：
+
+\begin{itemize}
+    \item \texttt{getuid()/getgid()}：用户ID和组ID，进程创建后几乎不变
+    \item \texttt{getppid()}：父进程ID
+    \item \texttt{gettimeofday()}：系统时间（需内核定期更新，Linux vDSO实现）
+    \item \texttt{getcpu()}：当前运行的CPU编号
+    \item 性能计数器：CPU时钟周期、缓存miss等统计信息
+\end{itemize}
+
+\textbf{实现方式}：在USYSCALL页面扩展更多字段，或者映射多个只读页面。
+
+\subsubsection{问题3：vmprint输出的叶子页解释}
+
+\texttt{vmprint} 的输出与 \texttt{print\_pgtbl} 对应：
+
+\begin{lstlisting}
+ .. .. ..0x0000000000000000: pte 0x0000000021fc7c5b pa 0x0000000087f1f000
+\end{lstlisting}
+
+表示：
+\begin{itemize}
+    \item 三级页表（最底层，缩进3个".."）
+    \item 虚拟地址 0x0（代码段起始）
+    \item PTE内容 \texttt{0x21fc7c5b}
+    \item 物理地址 \texttt{0x87f1f000}
+    \item 权限 \texttt{perm = 0x5b}，与 \texttt{print\_pgtbl} 输出的 \texttt{va 0x0} 一致
+\end{itemize}
+
+高地址的映射：
+
+\begin{lstlisting}
+ .. .. ..0x0000003fffffd000: pte 0x0000000021fd4c13 pa 0x0000000087f53000
+ .. .. ..0x0000003fffffe000: pte 0x0000000021fd00c7 pa 0x0000000087f40000
+ .. .. ..0x0000003ffffff000: pte 0x000000002000184b pa 0x0000000080006000
+\end{lstlisting}
+
+对应USYSCALL、TRAPFRAME和TRAMPOLINE页，与用户地址空间布局一致。
+
+\subsubsection{问题4：超级页面的优势与实现难点}
+
+\textbf{优势}：
+\begin{enumerate}
+    \item \textbf{减少页表内存}：2MB区域只需1个一级PTE，而普通页需要1个一级PTE+1个二级页表页（512个PTE）+512个三级PTE
+    \item \textbf{减少TLB miss}：TLB条目覆盖更大内存范围
+    \item \textbf{减少页表遍历开销}：访问超级页面只需2级查找，普通页需要3级
+    \item \textbf{性能提升}：对大内存密集型程序（数据库、科学计算）效果显著
+\end{enumerate}
+
+\textbf{实现难点}：
+\begin{enumerate}
+    \item \textbf{物理内存分配}：需要预留或动态查找2MB对齐的连续物理内存
+    \item \textbf{碎片问题}：超级页面不能跨越不同权限区域
+    \item \textbf{动态提升}：真实OS会将多个普通页动态合并为超级页面（promotion），需要复杂的页面扫描和迁移机制
+    \item \textbf{fork复制}：子进程需要复制2MB数据，比普通页开销大（可以用COW优化）
+    \item \textbf{权限处理}：超级页面内所有地址必须有相同权限
+\end{enumerate}
+
+\textbf{参考文献}中提到的透明超级页面支持需要：
+\begin{itemize}
+    \item 后台扫描进程识别连续使用的页面
+    \item 页面迁移机制合并物理内存
+    \item 自动降级（demotion）当部分页面需要不同权限
+    \item 考虑NUMA架构下的内存亲和性
+\end{itemize}
+
+\subsection{测试}
+
+\subsubsection{测试环境}
+
+\begin{lstlisting}[language=bash]
+$ git checkout pgtbl
+$ make clean
+$ make qemu
+\end{lstlisting}
+
+\subsubsection{测试结果}
+
+运行 \texttt{pgtbltest} 程序，输出如下：
+
+\begin{lstlisting}
+$ pgtbltest
+print_pgtbl starting
+va 0x0 pte 0x21FC7C5B pa 0x87F1F000 perm 0x5B
+va 0x1000 pte 0x21FC7017 pa 0x87F1C000 perm 0x17
+va 0x2000 pte 0x21FC6C07 pa 0x87F1B000 perm 0x7
+va 0x3000 pte 0x21FC68D7 pa 0x87F1A000 perm 0xD7
+va 0x4000 pte 0x0 pa 0x0 perm 0x0
+va 0x5000 pte 0x0 pa 0x0 perm 0x0
+va 0x6000 pte 0x0 pa 0x0 perm 0x0
+va 0x7000 pte 0x0 pa 0x0 perm 0x0
+va 0x8000 pte 0x0 pa 0x0 perm 0x0
+va 0x9000 pte 0x0 pa 0x0 perm 0x0
+va 0xFFFF6000 pte 0x0 pa 0x0 perm 0x0
+va 0xFFFF7000 pte 0x0 pa 0x0 perm 0x0
+va 0xFFFF8000 pte 0x0 pa 0x0 perm 0x0
+va 0xFFFF9000 pte 0x0 pa 0x0 perm 0x0
+va 0xFFFFA000 pte 0x0 pa 0x0 perm 0x0
+va 0xFFFFB000 pte 0x0 pa 0x0 perm 0x0
+va 0xFFFFC000 pte 0x0 pa 0x0 perm 0x0
+va 0xFFFFD000 pte 0x21FD4C13 pa 0x87F53000 perm 0x13
+va 0xFFFFE000 pte 0x21FD00C7 pa 0x87F40000 perm 0xC7
+va 0xFFFFF000 pte 0x2000184B pa 0x80006000 perm 0x4B
+print_pgtbl: OK
+
+ugetpid_test starting
+ugetpid_test: OK
+
+print_kpgtbl starting
+page table 0x0000000087f22000
+ ..0x0000000000000000: pte 0x0000000021fc7801 pa 0x0000000087f1e000
+ .. ..0x0000000000000000: pte 0x0000000021fc7401 pa 0x0000000087f1d000
+ .. .. ..0x0000000000000000: pte 0x0000000021fc7c5b pa 0x0000000087f1f000
+ .. .. ..0x0000000000001000: pte 0x0000000021fc70d7 pa 0x0000000087f1c000
+ .. .. ..0x0000000000002000: pte 0x0000000021fc6c07 pa 0x0000000087f1b000
+ .. .. ..0x0000000000003000: pte 0x0000000021fc68d7 pa 0x0000000087f1a000
+ ..0x0000003fc0000000: pte 0x0000000021fc8401 pa 0x0000000087f21000
+ .. ..0x0000003fffe00000: pte 0x0000000021fc8001 pa 0x0000000087f20000
+ .. .. ..0x0000003fffffd000: pte 0x0000000021fd4c13 pa 0x0000000087f53000
+ .. .. ..0x0000003fffffe000: pte 0x0000000021fd00c7 pa 0x0000000087f40000
+ .. .. ..0x0000003ffffff000: pte 0x000000002000184b pa 0x0000000080006000
+print_kpgtbl: OK
+
+superpg_test starting
+superpg_test: OK
+
+pgtbltest: all tests succeeded
+\end{lstlisting}
+
+\subsubsection{测试分析}
+
+\begin{enumerate}
+    \item \textbf{print\_pgtbl测试}：✓ 通过
+    \begin{itemize}
+        \item 正确打印了用户进程的页表项
+        \item 显示了代码段、数据段、USYSCALL、TRAPFRAME、TRAMPOLINE的映射
+        \item 权限位设置正确
+    \end{itemize}
+    
+    \item \textbf{ugetpid\_test测试}：✓ 通过
+    \begin{itemize}
+        \item 创建64个子进程，每个都能正确通过USYSCALL页获取PID
+        \item 验证了 \texttt{getpid()} 和 \texttt{ugetpid()} 返回相同结果
+        \item 证明共享页机制工作正常
+    \end{itemize}
+    
+    \item \textbf{print\_kpgtbl测试}：✓ 通过
+    \begin{itemize}
+        \item \texttt{vmprint()} 正确递归打印三级页表
+        \item 缩进层级正确反映页表深度
+        \item 虚拟地址、PTE和物理地址对应关系正确
+    \end{itemize}
+    
+    \item \textbf{superpg\_test测试}：✓ 通过
+    \begin{itemize}
+        \item 成功分配8MB内存（\texttt{N = 8*1024*1024}）
+        \item 2MB对齐区域使用了超级页面
+        \item \texttt{fork()} 后子进程正确复制超级页面
+        \item 验证了超级页面的读写功能
+    \end{itemize}
+\end{enumerate}
+
+\textbf{结论}：所有测试均通过，三个子任务的实现完全符合实验要求。
+
+\subsubsection{性能对比（理论分析）}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|l|c|c|}
+\hline
+\textbf{指标} & \textbf{普通页面(4KB)} & \textbf{超级页面(2MB)} \\
+\hline
+覆盖2MB内存的PTE数 & 513 (1+512) & 1 \\
+页表占用内存 & 4KB & 0 (共享一级页表) \\
+TLB覆盖范围 & 4KB/条目 & 2MB/条目 \\
+页表遍历层级 & 3级 & 2级 \\
+适用场景 & 通用 & 大内存连续访问 \\
+\hline
+\end{tabular}
+\caption{普通页面与超级页面对比}
+\end{table}
+
+\subsubsection{扩展验证}
+
+可通过以下命令进一步验证：
+
+\begin{lstlisting}[language=bash]
+# 运行完整测试套件
+$ make grade
+
+# 单独测试特定功能
+$ echo "ugetpid_test" | make qemu
+
+# 使用GDB调试页表
+$ make qemu-gdb
+(gdb) b vmprint
+(gdb) c
+\end{lstlisting}

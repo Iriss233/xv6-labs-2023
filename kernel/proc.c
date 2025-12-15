@@ -275,7 +275,7 @@ userinit(void)
 // Return 0 on success, -1 on failure.
 // 在 kernel/proc.c 中修改 growproc
 int
-growproc(int n)
+/*growproc(int n)
 {
   uint64 sz;
   struct proc *p = myproc();
@@ -283,6 +283,46 @@ growproc(int n)
   sz = p->sz;
   if(n > 0){
     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
+      return -1;
+    }
+  } else if(n < 0){
+    sz = uvmdealloc(p->pagetable, sz, sz + n);
+  }
+  p->sz = sz;
+  return 0;
+}*/
+growproc(int n)
+{
+  uint64 sz;
+  struct proc *p = myproc();
+
+  sz = p->sz;
+  uint64 oldsz = sz;
+  uint64 newsz=SUPERPGROUNDUP(sz);
+  int spgnum = n/SUPERPGSIZE;
+
+  if(n > 0){
+    if(spgnum > 0 && sz<newsz){
+      if((newsz = uvmalloc(p->pagetable, sz, newsz, PTE_W)) == 0) {
+        // printf("?");
+        return -1;
+      }
+      sz = newsz;
+      //注意这里一定要计时将进程p的sz更新，否则可能由于下一步的malloc/mallocsuper失败导致直接返回-1
+      //而p->sz未更新的情况。导致后面uvmfree时出错！
+      p->sz = sz;
+    }
+    if (spgnum > 0 && spgnum < 5){
+      if ((newsz = uvmalloc_super(p->pagetable, sz, sz + spgnum * SUPERPGSIZE, PTE_W)) == 0)
+      {
+        // printf("!");
+        return -1;
+      }
+      sz = newsz;
+      //与上同理
+      p->sz = sz;
+    }
+    if((sz = uvmalloc(p->pagetable, sz, oldsz + n, PTE_W)) == 0) {
       return -1;
     }
   } else if(n < 0){

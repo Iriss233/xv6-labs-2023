@@ -1,10 +1,32 @@
-Save time
-Skip printing and scanning and drive remote team efficiency with all the digital tools you need for working fast with documents.
 
+1. print_pgtbl 输出页表项解释：
+每一行代表一个虚拟页（va），其页表项（pte）、物理地址（pa）和权限（perm）。
+例如：
+va 0x0 pte 0x21FC7C5B pa 0x87F1F000 perm 0x5B
+含义如下：
+	- va：虚拟地址
+	- pte：页表项内容，包含物理页号和权限位
+	- pa：物理地址（PTE2PA(pte)）
+	- perm：权限位（PTE_FLAGS(pte)），如PTE_V（有效）、PTE_R（读）、PTE_W（写）、PTE_X（执行）、PTE_U（用户）、PTE_G（全局）、PTE_A（访问）、PTE_D（脏）等
+	- 若pte为0，表示该虚拟页未映射
 
-Reduce business costs
-With straightforward licensing and affordable pricing, it's finally possible to enjoy PDF productivity tools and eSigning for more efficient digital workflows.
+2. USYSCALL加速系统调用原理及可加速的其他系统调用：
+本实验通过在每个进程的用户页表中映射一个只读共享页（USYSCALL），存放struct usyscall（如pid）。用户态ugetpid()可直接读取该页，无需陷入内核，提升性能。
+类似地，其他只读、频繁查询的内核信息（如系统时间、调度统计等）也可通过此方式加速。
 
+3. vmprint输出页表项解释：
+vmprint递归打印多级页表，每一行显示当前级别的虚拟地址、pte内容和物理地址。缩进反映页表深度。
+叶子节点（最低级页表项）对应实际映射的物理页，权限位与print_pgtbl一致。
+例如：
+ .. .. ..0x0000000000000000: pte 0x0000000021fc7c5b pa 0x0000000087f1f000
+表示该虚拟地址已映射到物理地址0x87f1f000，pte内容和权限与print_pgtbl一致。
 
-Ensure maximum privacy
-Enjoy the same features as the online service, while processing your files on your computer for maximum privacy and compliance with business processes.
+4. 超级页面（superpage）实现说明：
+当sbrk分配2MB及以上且对齐时，内核分配超级页面（2MB大页），减少页表项数量，提高TLB命中率。实现时需在kalloc.c中管理2MB物理块，在uvmalloc/uvmcopy/uvmunmap等函数中识别并处理超级页面。
+超级页面的PTE需设置PTE_V|PTE_R|PTE_W等权限，且物理地址2MB对齐。
+
+5. 结合代码说明：
+- memlayout.h/proc.h/proc.c实现了USYSCALL共享页
+- vm.c实现了递归页表打印和超级页面支持
+- kalloc.c实现了超级页面分配与释放
+- 所有功能通过pgtbltest验证
