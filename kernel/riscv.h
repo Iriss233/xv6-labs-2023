@@ -382,6 +382,7 @@ typedef uint64 *pagetable_t; // 512 PTEs
 #define MAXVA (1L << (9 + 9 + 9 + 12 - 1))
 
 #ifndef __ASSEMBLER__
+   // 只在 C 编译时生效
 // 读取 s0 寄存器（当前帧指针）
 static inline uint64
 r_fp()

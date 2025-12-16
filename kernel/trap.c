@@ -75,6 +75,9 @@ usertrap(void)
   if(killed(p))
     exit(-1);
 
+  /*
+  在 RISC‑V 上，xv6 会配置定时器，使 CPU 周期性产生 timer interrupt。这类中断是“异步”的：不管用户程序在干嘛，时间一到硬件就发中断
+  */
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2){
     if(p->interval != 0) { // 如果设定了时钟事件
@@ -82,7 +85,7 @@ usertrap(void)
         if(!p->alarm_goingoff) { // 确保没有时钟正在运行
           p->ticks = 0;
           *(p->alarm_trapframe) = *(p->trapframe);
-          p->trapframe->epc = (uint64)p->handler;
+          p->trapframe->epc = (uint64)p->handler; //用户态PC改成了 handler 的入口地址
           p->alarm_goingoff = 1;
         }
       }
@@ -243,5 +246,5 @@ int sigreturn() {
   p->alarm_goingoff = 0;
   // 这里返回a0的原因是，当我们执行return的时候，返回值会被保存在a0中
   // 导致a0被覆盖，所以此时直接返回a0即可，我们在最后会进行分析
-  return p->trapframe->a0;
+  return p->trapframe->a0; // 因为第244行，所以返回a0是正确的
 }
