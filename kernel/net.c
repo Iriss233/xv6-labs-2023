@@ -286,7 +286,7 @@ void
 ip_rx(char *buf, int len)
 {
   // 不删除此打印，make grade依赖它
-  static int seen_ip = 0;
+  static int seen_ip = 0; 
   if (seen_ip == 0)
     printf("ip_rx: received an IP packet\n");
   seen_ip = 1;
@@ -353,7 +353,7 @@ ip_rx(char *buf, int len)
 
   // 将数据包加入对应端口的队列
   struct port_queue *q = &ports[dport];
-  acquire(&q->lock);
+  acquire(&q->lock); 
 
   // 若队列已满（超过MAX_UDP_PACKETS），丢弃新包
   if (q->count >= MAX_UDP_PACKETS) {
